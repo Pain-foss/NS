@@ -42,7 +42,6 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install lz4 capstone fonttools zstandard gdown
 
-          # Compilar hactool para extraer NSP/XCI
           git clone --depth 1 https://github.com/SciresM/hactool.git "$RUNNER_TEMP/hactool"
           cd "$RUNNER_TEMP/hactool"
           cp config.mk.template config.mk
@@ -131,7 +130,6 @@ jobs:
           EXTRACTED_GAME="$RUNNER_TEMP/ExtractedGame"
           mkdir -p "$PKG_DIR" "$EXTRACTED_GAME/exefs" "$EXTRACTED_GAME/romfs"
 
-          # 1. Descomprimir si viene en ZIP/RAR/7z o identificar como NSP/XCI directo
           python - "$WORK" "$PKG_DIR" <<'PY'
           import shutil
           import subprocess
@@ -176,7 +174,6 @@ jobs:
                   raise SystemExit(f"Unsupported file format for {label}.")
           PY
 
-          # 2. Extraer NCAs usando hactool (soporta tanto XCI como NSP)
           NCA_BASE="$WORK/nca_base"
           NCA_UPD="$WORK/nca_update"
           mkdir -p "$NCA_BASE" "$NCA_UPD"
@@ -197,7 +194,6 @@ jobs:
             hactool -k "$WORK/prod.keys" -t pfs0 --pfs0dir="$NCA_UPD" "$PKG_DIR/update.nsp"
           fi
 
-          # 3. Localizar el Program NCA más grande (el que contiene el juego) y extraer exefs/romfs
           BASE_PROG_NCA="$(find "$NCA_BASE" -name "*.nca" -type f -exec ls -S {} + | head -n 1)"
           echo "Base Program NCA: $BASE_PROG_NCA"
 
@@ -236,6 +232,7 @@ jobs:
           PROFILE_ID="${PROFILE_OVERRIDE:-010051F0207B2000}"
           PROFILE_ID="$(echo "$PROFILE_ID" | tr '[:lower:]' '[:upper:]')"
 
+          export DM_GAME="$PROFILE_ID"
           echo "DM_GAME=$PROFILE_ID" >> "$GITHUB_ENV"
 
           python dm/gfx/tools/dmsh_chain.py --update-lock
@@ -248,11 +245,12 @@ jobs:
           EXTRACTED_GAME="$RUNNER_TEMP/ExtractedGame"
           OUTPUT_IPA="$RUNNER_TEMP/Tomodachi-Native.ipa"
 
+          export DM_GAME="${DM_GAME:-010051F0207B2000}"
           export GAME_DIR="$EXTRACTED_GAME"
+
           bash dm/ios/tools/build_ipa.sh "$EXTRACTED_GAME"
 
-          # Localizar el IPA generado por build_ipa.sh y copiarlo a RUNNER_TEMP
-          BUILT_IPA="$(find dm/ios -name "*.ipa" -type f -print -quit)"
+          BUILT_IPA="$(find dm/ios -name "*.ipa" -type f -print -quit || find . -name "*.ipa" -type f -print -quit)"
 
           if [[ -z "$BUILT_IPA" || ! -s "$BUILT_IPA" ]]; then
             echo "::error::IPA build did not produce an output file."
