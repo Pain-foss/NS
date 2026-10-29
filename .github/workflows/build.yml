@@ -63,14 +63,15 @@ jobs:
           download_file() {
             local url="$1"
             local output="$2"
-            local file_id
 
             if [[ -z "${url:-}" ]]; then
               echo "::error::A required download URL is empty."
               exit 1
             fi
 
-            file_id="$(python - "$url" <<'PY'
+            if [[ "$url" =~ drive\.google\.com ]]; then
+              local file_id
+              file_id="$(python - "$url" <<'PY'
           import re
           import sys
           from urllib.parse import urlparse, parse_qs
@@ -96,9 +97,20 @@ jobs:
           print(file_id)
           PY
           )"
+              echo "Downloading $(basename "$output") via gdown..."
+              gdown "$file_id" -O "$output"
+            else
+              if [[ "$url" =~ dropbox\.com ]]; then
+                url="${url/\?dl=0/?dl=1}"
+                url="${url/&dl=0/&dl=1}"
+                if [[ ! "$url" =~ dl=1 ]]; then
+                  url="${url}?dl=1"
+                fi
+              fi
 
-            echo "Downloading $(basename "$output")..."
-            gdown "$file_id" -O "$output"
+              echo "Downloading $(basename "$output") via direct link..."
+              curl -L -f --retry 3 --retry-delay 5 -o "$output" "$url"
+            fi
 
             if [[ ! -s "$output" ]]; then
               echo "::error::Downloaded file is empty."
@@ -122,9 +134,14 @@ jobs:
           chmod 600 "$WORK/prod.keys"
 
       - name: Extract NSP or XCI into ExeFS and RomFS
+        env:
+          PROFILE_OVERRIDE: ${{ inputs.profile_id }}
         shell: bash
         run: |
           set -euo pipefail
+          PROFILE_ID="${PROFILE_OVERRIDE:-010051F0207B2000}"
+          PROFILE_ID="$(echo "$PROFILE_ID" | tr '[:lower:]' '[:upper:]')"
+
           WORK="$RUNNER_TEMP/nxnative"
           PKG_DIR="$RUNNER_TEMP/Packages"
           EXTRACTED_GAME="$RUNNER_TEMP/ExtractedGame"
@@ -194,6 +211,7 @@ jobs:
             hactool -k "$WORK/prod.keys" -t pfs0 --pfs0dir="$NCA_UPD" "$PKG_DIR/update.nsp"
           fi
 
+          # 1. Extraer Program NCA (exefs y romfs)
           BASE_PROG_NCA="$(find "$NCA_BASE" -name "*.nca" -type f -exec ls -S {} + | head -n 1)"
           echo "Base Program NCA: $BASE_PROG_NCA"
 
@@ -214,14 +232,92 @@ jobs:
               --romfsdir="$EXTRACTED_GAME/romfs"
           fi
 
+          # 2. Extraer Control NCA (control.nacp e iconos)
+          echo "Buscando y extrayendo Control NCA..."
+          python - "$NCA_BASE" "$NCA_UPD" "$WORK/prod.keys" "$EXTRACTED_GAME" <<'PY'
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          nca_base = Path(sys.argv[1])
+          nca_upd = Path(sys.argv[2])
+          keys_file = Path(sys.argv[3])
+          out_dir = Path(sys.argv[4])
+
+          all_ncas = []
+          if nca_upd.exists():
+              all_ncas.extend(sorted(nca_upd.glob("*.nca"), key=lambda p: p.stat().st_size))
+          if nca_base.exists():
+              all_ncas.extend(sorted(nca_base.glob("*.nca"), key=lambda p: p.stat().st_size))
+
+          found_control = False
+          for nca in all_ncas:
+              size = nca.stat().st_size
+              if 50_000 < size < 60_000_000:
+                  temp_romfs = out_dir / "temp_control_romfs"
+                  temp_romfs.mkdir(parents=True, exist_ok=True)
+                  subprocess.run(
+                      ["hactool", "-k", str(keys_file), f"--romfsdir={temp_romfs}", str(nca)],
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL
+                  )
+                  nacp = temp_romfs / "control.nacp"
+                  if nacp.exists() and nacp.stat().st_size > 0:
+                      print(f"control.nacp encontrado en {nca.name}")
+                      for item in temp_romfs.iterdir():
+                          dest = out_dir / item.name
+                          if item.is_file():
+                              import shutil
+                              shutil.copy2(item, dest)
+                      import shutil
+                      shutil.rmtree(temp_romfs, ignore_errors=True)
+                      found_control = True
+                      break
+                  import shutil
+                  shutil.rmtree(temp_romfs, ignore_errors=True)
+
+          # Si no vino control.nacp, generar estructura de respaldo válida de 0x4000 bytes
+          nacp_file = out_dir / "control.nacp"
+          if not nacp_file.exists():
+              print("Creando control.nacp de respaldo...")
+              buf = bytearray(0x4000)
+              title = b"Tomodachi Life: Living the Dream\x00"
+              pub = b"Nintendo\x00"
+              for i in range(16):
+                  off = i * 0x300
+                  buf[off:off+len(title)] = title
+                  buf[off+0x200:off+0x200+len(pub)] = pub
+              with open(nacp_file, "wb") as f:
+                  f.write(buf)
+
+          # Asegurar copia de icono estándar
+          for icon in out_dir.glob("icon_*.dat"):
+              import shutil
+              shutil.copy2(icon, out_dir / "icon.jpg")
+              shutil.copy2(icon, out_dir / "icon.png")
+              break
+          PY
+
+          # 3. Preparar la estructura en el directorio de trabajo ~/TITLEID-work/data/v0
+          TARGET_WORK_V0="${HOME}/${PROFILE_ID}-work/data/v0"
+          mkdir -p "${HOME}/${PROFILE_ID}-work/data"
+          rm -rf "$TARGET_WORK_V0"
+          mkdir -p "$TARGET_WORK_V0"
+
+          ln -sfn "$EXTRACTED_GAME/exefs" "$TARGET_WORK_V0/exefs"
+          ln -sfn "$EXTRACTED_GAME/romfs" "$TARGET_WORK_V0/romfs"
+          cp "$EXTRACTED_GAME"/control.nacp "$TARGET_WORK_V0/"
+          cp "$EXTRACTED_GAME"/icon* "$TARGET_WORK_V0/" 2>/dev/null || true
+
+          echo "DM_DISPLAY_NAME=Tomodachi Life: Living the Dream" >> "$GITHUB_ENV"
+
           if [[ ! -f "$EXTRACTED_GAME/exefs/main" ]]; then
-            echo "::error::Failed to extract exefs/main. Verify your prod.keys and game dump."
+            echo "::error::Failed to extract exefs/main."
             exit 1
           fi
 
-          echo "Extraction complete:"
-          ls -la "$EXTRACTED_GAME/exefs"
-          ls -la "$EXTRACTED_GAME/romfs"
+          echo "Extraction and workspace configuration complete:"
+          ls -la "$TARGET_WORK_V0"
 
       - name: Set Shader Profile and Update Toolchain Header
         env:
@@ -250,6 +346,8 @@ jobs:
           PROFILE_ID="${GAME:-010051F0207B2000}"
           export GAME="$PROFILE_ID"
           export DM_GAME="$PROFILE_ID"
+          export DM_DISPLAY_NAME="Tomodachi Life: Living the Dream"
+          export WORK_DIR="${HOME}/${PROFILE_ID}-work"
           export GAME_DIR="$EXTRACTED_GAME"
           export ROMFS_DIR="$EXTRACTED_GAME/romfs"
           export EXEFS_DIR="$EXTRACTED_GAME/exefs"
@@ -259,9 +357,9 @@ jobs:
 
           chmod +x dm/ios/tools/*.sh || true
 
-          GAME="$PROFILE_ID" bash dm/ios/tools/build_ipa.sh "$EXTRACTED_GAME"
+          GAME="$PROFILE_ID" DM_DISPLAY_NAME="$DM_DISPLAY_NAME" bash dm/ios/tools/build_ipa.sh "$EXTRACTED_GAME"
 
-          BUILT_IPA="$(find . "$RUNNER_TEMP" -name "*.ipa" -type f -not -path "*/ExtractedGame/*" -not -path "$OUTPUT_IPA" -print -quit)"
+          BUILT_IPA="$(find . "$RUNNER_TEMP" "$HOME" -name "*.ipa" -type f -not -path "*/ExtractedGame/*" -not -path "$OUTPUT_IPA" -print -quit)"
 
           if [[ -z "$BUILT_IPA" || ! -s "$BUILT_IPA" ]]; then
             echo "::error::IPA build did not produce an output file."
@@ -288,4 +386,5 @@ jobs:
           rm -rf \
             "$RUNNER_TEMP/nxnative" \
             "$RUNNER_TEMP/Packages" \
-            "$RUNNER_TEMP/ExtractedGame"
+            "$RUNNER_TEMP/ExtractedGame" \
+            "${HOME}/${GAME:-010051F0207B2000}-work"
