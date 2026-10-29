@@ -40,7 +40,7 @@ jobs:
           set -euo pipefail
           brew install xcodegen zstd spirv-cross unar cmake pkg-config
           python -m pip install --upgrade pip
-          python -m pip install lz4 capstone fonttools zstandard gdown
+          python -m pip install lz4 capstone fonttools zstandard backports.zstd gdown
 
           git clone --depth 1 https://github.com/SciresM/hactool.git "$RUNNER_TEMP/hactool"
           cd "$RUNNER_TEMP/hactool"
@@ -236,7 +236,7 @@ jobs:
           echo "DM_GAME=$PROFILE_ID" >> "$GITHUB_ENV"
 
           python dm/gfx/tools/dmsh_chain.py --update-lock
-          python dm/gfx/tools/dmsh_chain.py --header "$PROFILE_ID"
+          python dm/gfx/tools/dmsh_chain.py --header
 
       - name: Build Unsigned IPA
         shell: bash
@@ -247,10 +247,18 @@ jobs:
 
           export DM_GAME="${DM_GAME:-010051F0207B2000}"
           export GAME_DIR="$EXTRACTED_GAME"
+          export ROMFS_DIR="$EXTRACTED_GAME/romfs"
+          export EXEFS_DIR="$EXTRACTED_GAME/exefs"
+          export CODE_SIGNING_ALLOWED=NO
+          export CODE_SIGN_IDENTITY=""
+          export CODE_SIGNING_REQUIRED=NO
+
+          chmod +x dm/ios/tools/*.sh || true
 
           bash dm/ios/tools/build_ipa.sh "$EXTRACTED_GAME"
 
-          BUILT_IPA="$(find dm/ios -name "*.ipa" -type f -print -quit || find . -name "*.ipa" -type f -print -quit)"
+          # Buscar el archivo .ipa generado en el workspace o en RUNNER_TEMP
+          BUILT_IPA="$(find . "$RUNNER_TEMP" -name "*.ipa" -type f -not -path "*/ExtractedGame/*" -not -path "$OUTPUT_IPA" -print -quit)"
 
           if [[ -z "$BUILT_IPA" || ! -s "$BUILT_IPA" ]]; then
             echo "::error::IPA build did not produce an output file."
@@ -258,7 +266,7 @@ jobs:
           fi
 
           cp "$BUILT_IPA" "$OUTPUT_IPA"
-          echo "IPA successfully created: $OUTPUT_IPA"
+          echo "IPA successfully created at: $OUTPUT_IPA"
           ls -lh "$OUTPUT_IPA"
 
       - name: Upload IPA
