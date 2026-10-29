@@ -24,6 +24,29 @@ jobs:
           repository: kuosuko/tomodachi-native
           ref: 5587d1bd8e311b5508ed4e8d5310796523d06ed6
 
+      - name: Patch DuoTypeCard compilation error
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          target = Path("dm/ios/Sources/DuoTypeCard.m")
+          if target.exists():
+              lines = target.read_text(encoding="utf-8").splitlines()
+              patched = []
+              skip_next = False
+              for line in lines:
+                  if "UIViewReservedRegion" in line:
+                      patched.append("// " + line)
+                      skip_next = True
+                  elif skip_next and "r" in line:
+                      patched.append("// " + line)
+                      skip_next = False
+                  else:
+                      patched.append(line)
+              target.write_text("\n".join(patched), encoding="utf-8")
+              print("DuoTypeCard.m parcheado correctamente.")
+          PY
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -128,6 +151,12 @@ jobs:
 
           chmod 600 "$WORK/prod.keys"
 
+      - name: Restore compiled shaders cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/GameFiles/*_build/shader
+          key: shader-cache-${{ inputs.profile_id || '010051F0207B2000' }}
+
       # Solo prepara la carpeta con los NSP/XCI. La extraccion real la hace
       # build_ipa_from_nsp.py (con LibHac), no hactool.
       - name: Prepare game package folder
@@ -162,9 +191,6 @@ jobs:
           )
 
           def xci_to_nsp(xci, nsp):
-              # build_ipa_from_nsp.py solo mira *.nsp, asi que un XCI se reempaqueta:
-              # las NCA de la particion "secure" (HFS0) pasan tal cual a un NSP (PFS0).
-              # Las NCA de cartucho no usan titlekey, por eso no hace falta ticket.
               with xci.open("rb") as f:
                   def rd(off, n):
                       f.seek(off)
@@ -173,12 +199,14 @@ jobs:
                   base = next((b for b in (0x0, 0x1000) if rd(b + 0x100, 4) == b"HEAD"), None)
                   if base is None:
                       raise SystemExit(f"{xci.name}: not a valid XCI (no HEAD header).")
-                  root = base + struct.unpack("<Q", rd(base + 0x138, 8))[0]
+                  root = base + (struct.unpack("<I", rd(base + 0x130, 4))[0] * 0x200)
+                  if rd(root, 4) != b"HFS0":
+                      root = base + 0xF000
 
                   def hfs0(off):
                       h = rd(off, 0x10)
                       if h[:4] != b"HFS0":
-                          raise SystemExit(f"{xci.name}: invalid HFS0 partition.")
+                          raise SystemExit(f"{xci.name}: invalid HFS0 partition at 0x{off:X}.")
                       count, strsz = struct.unpack_from("<II", h, 4)
                       ents = rd(off + 0x10, count * 0x40)
                       strs = rd(off + 0x10 + count * 0x40, strsz)
@@ -222,15 +250,11 @@ jobs:
               print(f"Converted {xci.name} -> {nsp.name}: {len(files)} files, {nsp.stat().st_size:,} bytes")
 
           def final_name(label, original_name, ext):
-              # El script detecta el juego por "[TitleID]" en el nombre (un XCI no
-              # tiene ticket) y el update por el tag "[vN]". Si el archivo ya trae
-              # un [TitleID], se respeta; si no, se le pone uno.
               if re.search(r"\[[0-9A-Fa-f]{16}\]", original_name):
                   return original_name
               if label == "game":
                   return f"Tomodachi Life [{profile_id}][v0]{ext}"
               if label == "update":
-                  # el title ID de un update es el del juego base con 0x800 sumado
                   upd_id = f"{int(profile_id, 16) + 0x800:016X}"
                   return f"Tomodachi Life [{upd_id}][v65536]{ext}"
               return f"{label}{ext}"
@@ -239,7 +263,7 @@ jobs:
               if source.suffix.lower() == ".xci":
                   nsp = source.with_suffix(".nsp")
                   xci_to_nsp(source, nsp)
-                  source.unlink()  # liberar disco: el XCI ya no hace falta
+                  source.unlink()
                   source = nsp
               target = game_dir / final_name(label, source.name, source.suffix.lower())
               if target.exists():
@@ -257,7 +281,7 @@ jobs:
                   sig = f.read(8)
                   f.seek(0x100)
                   xci_sig = f.read(4)
-                  f.seek(0x1100)  # algunos dumps traen 0x1000 bytes extra al inicio
+                  f.seek(0x1100)
                   xci_sig2 = f.read(4)
 
               if any(sig.startswith(m) for m in archive_signatures):
@@ -273,12 +297,10 @@ jobs:
                   for p in packages:
                       add(p, label)
               elif sig[:4] == b"PFS0":
-                  # NSP directo
                   nsp = source.with_name(f"{label}.nsp")
                   source.rename(nsp)
                   add(nsp, label)
               elif b"HEAD" in (xci_sig, xci_sig2):
-                  # XCI directo (la firma "HEAD" esta en el offset 0x100); add() lo convierte a NSP
                   xci = source.with_name(f"{label}.xci")
                   source.rename(xci)
                   add(xci, label)
@@ -351,6 +373,13 @@ jobs:
           echo "IPA successfully created: $OUTPUT"
           ls -lh "$OUTPUT"
 
+      - name: Save compiled shaders cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ${{ runner.temp }}/GameFiles/*_build/shader
+          key: shader-cache-${{ inputs.profile_id || '010051F0207B2000' }}
+
       - name: Upload IPA
         if: success()
         uses: actions/upload-artifact@v4
@@ -375,6 +404,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          rm -rf \
-            "$RUNNER_TEMP/nxnative" \
-            "$RUNNER_TEMP/GameFiles"
+          rm -rf "$RUNNER_TEMP/nxnative"
+          rm -rf "$RUNNER_TEMP/GameFiles"/*_build/extract
+          rm -rf "$RUNNER_TEMP/GameFiles"/*.nsp
+          rm -rf "$RUNNER_TEMP/GameFiles"/*.xci
