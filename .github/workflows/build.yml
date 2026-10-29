@@ -27,26 +27,21 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.13"
 
+      # El fork necesita .NET 10 (nx_extract con LibHac y el traductor de shaders)
       - name: Set up .NET SDK
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: "8.0.x"
+          dotnet-version: "10.0.x"
 
-      - name: Install dependencies and build hactool
+      - name: Install dependencies
         shell: bash
         run: |
           set -euo pipefail
-          brew install xcodegen zstd spirv-cross unar cmake pkg-config
+          brew install xcodegen zstd spirv-cross unar
           python -m pip install --upgrade pip
-          python -m pip install lz4 capstone fonttools zstandard backports.zstd gdown
-
-          git clone --depth 1 https://github.com/SciresM/hactool.git "$RUNNER_TEMP/hactool"
-          cd "$RUNNER_TEMP/hactool"
-          cp config.mk.template config.mk
-          make -j"$(sysctl -n hw.ncpu)"
-          sudo cp hactool /usr/local/bin/
+          python -m pip install lz4 capstone fonttools backports.zstd gdown
 
       - name: Download game files and keys
         env:
@@ -133,7 +128,9 @@ jobs:
 
           chmod 600 "$WORK/prod.keys"
 
-      - name: Extract NSP or XCI into ExeFS and RomFS
+      # Solo prepara la carpeta con los NSP/XCI. La extraccion real la hace
+      # build_ipa_from_nsp.py (con LibHac), no hactool.
+      - name: Prepare game package folder
         env:
           PROFILE_OVERRIDE: ${{ inputs.profile_id }}
         shell: bash
@@ -141,20 +138,22 @@ jobs:
           set -euo pipefail
           PROFILE_ID="${PROFILE_OVERRIDE:-010051F0207B2000}"
           PROFILE_ID="$(echo "$PROFILE_ID" | tr '[:lower:]' '[:upper:]')"
-
           WORK="$RUNNER_TEMP/nxnative"
-          PKG_DIR="$RUNNER_TEMP/Packages"
-          EXTRACTED_GAME="$RUNNER_TEMP/ExtractedGame"
-          mkdir -p "$PKG_DIR" "$EXTRACTED_GAME/exefs" "$EXTRACTED_GAME/romfs"
+          GAME_DIR="$RUNNER_TEMP/GameFiles"
+          mkdir -p "$GAME_DIR"
 
-          python - "$WORK" "$PKG_DIR" <<'PY'
+          python - "$WORK" "$GAME_DIR" "$PROFILE_ID" <<'PY'
+          import re
           import shutil
+          import struct
           import subprocess
           import sys
           from pathlib import Path
 
           work = Path(sys.argv[1])
-          pkg_dir = Path(sys.argv[2])
+          game_dir = Path(sys.argv[2])
+          profile_id = sys.argv[3]
+          package_extensions = {".nsp", ".xci"}
           archive_signatures = (
               b"Rar!\x1a\x07\x00",
               b"Rar!\x1a\x07\x01\x00",
@@ -162,164 +161,152 @@ jobs:
               b"7z\xbc\xaf\x27\x1c",
           )
 
-          for label in ("game", "update"):
+          def xci_to_nsp(xci, nsp):
+              # build_ipa_from_nsp.py solo mira *.nsp, asi que un XCI se reempaqueta:
+              # las NCA de la particion "secure" (HFS0) pasan tal cual a un NSP (PFS0).
+              # Las NCA de cartucho no usan titlekey, por eso no hace falta ticket.
+              with xci.open("rb") as f:
+                  def rd(off, n):
+                      f.seek(off)
+                      return f.read(n)
+
+                  base = next((b for b in (0x0, 0x1000) if rd(b + 0x100, 4) == b"HEAD"), None)
+                  if base is None:
+                      raise SystemExit(f"{xci.name}: not a valid XCI (no HEAD header).")
+                  root = base + struct.unpack("<Q", rd(base + 0x138, 8))[0]
+
+                  def hfs0(off):
+                      h = rd(off, 0x10)
+                      if h[:4] != b"HFS0":
+                          raise SystemExit(f"{xci.name}: invalid HFS0 partition.")
+                      count, strsz = struct.unpack_from("<II", h, 4)
+                      ents = rd(off + 0x10, count * 0x40)
+                      strs = rd(off + 0x10 + count * 0x40, strsz)
+                      data = off + 0x10 + count * 0x40 + strsz
+                      out = []
+                      for i in range(count):
+                          o, s, n = struct.unpack_from("<QQI", ents, i * 0x40)
+                          out.append((strs[n:strs.index(b"\0", n)].decode(), data + o, s))
+                      return out
+
+                  parts = {name: off for name, off, _ in hfs0(root)}
+                  if "secure" not in parts:
+                      raise SystemExit(f"{xci.name}: no 'secure' partition found.")
+                  files = hfs0(parts["secure"])
+                  if not files:
+                      raise SystemExit(f"{xci.name}: the 'secure' partition is empty.")
+
+                  names, name_offs = b"", []
+                  for name, _, _ in files:
+                      name_offs.append(len(names))
+                      names += name.encode() + b"\0"
+                  names += b"\0" * ((-(0x10 + len(files) * 0x18 + len(names))) % 0x20)
+
+                  entries, pos = b"", 0
+                  for (_, _, size), no in zip(files, name_offs):
+                      entries += struct.pack("<QQII", pos, size, no, 0)
+                      pos += size
+
+                  with nsp.open("wb") as out:
+                      out.write(b"PFS0" + struct.pack("<III", len(files), len(names), 0))
+                      out.write(entries + names)
+                      for name, off, size in files:
+                          f.seek(off)
+                          left = size
+                          while left:
+                              chunk = f.read(min(left, 8 * 1024 * 1024))
+                              if not chunk:
+                                  raise SystemExit(f"{xci.name}: truncated file (is the download complete?).")
+                              out.write(chunk)
+                              left -= len(chunk)
+              print(f"Converted {xci.name} -> {nsp.name}: {len(files)} files, {nsp.stat().st_size:,} bytes")
+
+          def final_name(label, original_name, ext):
+              # El script detecta el juego por "[TitleID]" en el nombre (un XCI no
+              # tiene ticket) y el update por el tag "[vN]". Si el archivo ya trae
+              # un [TitleID], se respeta; si no, se le pone uno.
+              if re.search(r"\[[0-9A-Fa-f]{16}\]", original_name):
+                  return original_name
+              if label == "game":
+                  return f"Tomodachi Life [{profile_id}][v0]{ext}"
+              if label == "update":
+                  # el title ID de un update es el del juego base con 0x800 sumado
+                  upd_id = f"{int(profile_id, 16) + 0x800:016X}"
+                  return f"Tomodachi Life [{upd_id}][v65536]{ext}"
+              return f"{label}{ext}"
+
+          def add(source, label):
+              if source.suffix.lower() == ".xci":
+                  nsp = source.with_suffix(".nsp")
+                  xci_to_nsp(source, nsp)
+                  source.unlink()  # liberar disco: el XCI ya no hace falta
+                  source = nsp
+              target = game_dir / final_name(label, source.name, source.suffix.lower())
+              if target.exists():
+                  raise SystemExit(f"Duplicate package filename: {target.name}")
+              shutil.move(str(source), str(target))
+              print(f"Added {label}: {target.name} ({target.stat().st_size:,} bytes)")
+
+          def process(label):
               source = work / f"{label}.download"
               if not source.exists():
-                  continue
+                  print(f"No {label} download; skipping.")
+                  return
 
               with source.open("rb") as f:
                   sig = f.read(8)
                   f.seek(0x100)
                   xci_sig = f.read(4)
+                  f.seek(0x1100)  # algunos dumps traen 0x1000 bytes extra al inicio
+                  xci_sig2 = f.read(4)
 
               if any(sig.startswith(m) for m in archive_signatures):
-                  ext_dir = work / f"ext_{label}"
+                  ext_dir = work / f"extracted-{label}"
                   ext_dir.mkdir(parents=True, exist_ok=True)
                   subprocess.run(["unar", "-o", str(ext_dir), str(source)], check=True)
-                  found = [
+                  packages = sorted(
                       p for p in ext_dir.rglob("*")
-                      if p.is_file() and p.suffix.lower() in (".nsp", ".xci")
-                  ]
-                  if not found:
-                      raise SystemExit(f"No .nsp or .xci found inside {label} archive.")
-                  shutil.move(str(found[0]), str(pkg_dir / f"{label}{found[0].suffix.lower()}"))
-              elif sig[:4] == b"PFS0":
-                  shutil.move(str(source), str(pkg_dir / f"{label}.nsp"))
-              elif xci_sig == b"HEAD":
-                  shutil.move(str(source), str(pkg_dir / f"{label}.xci"))
-              else:
-                  raise SystemExit(f"Unsupported file format for {label}.")
-          PY
-
-          NCA_BASE="$WORK/nca_base"
-          NCA_UPD="$WORK/nca_update"
-          mkdir -p "$NCA_BASE" "$NCA_UPD"
-
-          if [[ -f "$PKG_DIR/game.xci" ]]; then
-            echo "Extracting base XCI..."
-            hactool -k "$WORK/prod.keys" -t xci --securedir="$NCA_BASE" "$PKG_DIR/game.xci"
-          elif [[ -f "$PKG_DIR/game.nsp" ]]; then
-            echo "Extracting base NSP..."
-            hactool -k "$WORK/prod.keys" -t pfs0 --pfs0dir="$NCA_BASE" "$PKG_DIR/game.nsp"
-          fi
-
-          if [[ -f "$PKG_DIR/update.xci" ]]; then
-            echo "Extracting update XCI..."
-            hactool -k "$WORK/prod.keys" -t xci --securedir="$NCA_UPD" "$PKG_DIR/update.xci"
-          elif [[ -f "$PKG_DIR/update.nsp" ]]; then
-            echo "Extracting update NSP..."
-            hactool -k "$WORK/prod.keys" -t pfs0 --pfs0dir="$NCA_UPD" "$PKG_DIR/update.nsp"
-          fi
-
-          # 1. Extraer Program NCA (exefs y romfs)
-          BASE_PROG_NCA="$(find "$NCA_BASE" -name "*.nca" -type f -exec ls -S {} + | head -n 1)"
-          echo "Base Program NCA: $BASE_PROG_NCA"
-
-          UPD_PROG_NCA=""
-          if [[ -d "$NCA_UPD" ]]; then
-            UPD_PROG_NCA="$(find "$NCA_UPD" -name "*.nca" -type f -exec ls -S {} + | head -n 1 || true)"
-          fi
-
-          if [[ -n "$UPD_PROG_NCA" ]]; then
-            echo "Update Program NCA detected: $UPD_PROG_NCA"
-            hactool -k "$WORK/prod.keys" --basenca="$BASE_PROG_NCA" "$UPD_PROG_NCA" \
-              --exefsdir="$EXTRACTED_GAME/exefs" \
-              --romfsdir="$EXTRACTED_GAME/romfs"
-          else
-            echo "Extracting directly from Base Program NCA..."
-            hactool -k "$WORK/prod.keys" "$BASE_PROG_NCA" \
-              --exefsdir="$EXTRACTED_GAME/exefs" \
-              --romfsdir="$EXTRACTED_GAME/romfs"
-          fi
-
-          # 2. Extraer Control NCA (control.nacp e iconos)
-          echo "Buscando y extrayendo Control NCA..."
-          python - "$NCA_BASE" "$NCA_UPD" "$WORK/prod.keys" "$EXTRACTED_GAME" <<'PY'
-          import subprocess
-          import sys
-          from pathlib import Path
-
-          nca_base = Path(sys.argv[1])
-          nca_upd = Path(sys.argv[2])
-          keys_file = Path(sys.argv[3])
-          out_dir = Path(sys.argv[4])
-
-          all_ncas = []
-          if nca_upd.exists():
-              all_ncas.extend(sorted(nca_upd.glob("*.nca"), key=lambda p: p.stat().st_size))
-          if nca_base.exists():
-              all_ncas.extend(sorted(nca_base.glob("*.nca"), key=lambda p: p.stat().st_size))
-
-          found_control = False
-          for nca in all_ncas:
-              size = nca.stat().st_size
-              if 50_000 < size < 60_000_000:
-                  temp_romfs = out_dir / "temp_control_romfs"
-                  temp_romfs.mkdir(parents=True, exist_ok=True)
-                  subprocess.run(
-                      ["hactool", "-k", str(keys_file), f"--romfsdir={temp_romfs}", str(nca)],
-                      stdout=subprocess.DEVNULL,
-                      stderr=subprocess.DEVNULL
+                      if p.is_file() and p.suffix.lower() in package_extensions
                   )
-                  nacp = temp_romfs / "control.nacp"
-                  if nacp.exists() and nacp.stat().st_size > 0:
-                      print(f"control.nacp encontrado en {nca.name}")
-                      for item in temp_romfs.iterdir():
-                          dest = out_dir / item.name
-                          if item.is_file():
-                              import shutil
-                              shutil.copy2(item, dest)
-                      import shutil
-                      shutil.rmtree(temp_romfs, ignore_errors=True)
-                      found_control = True
-                      break
-                  import shutil
-                  shutil.rmtree(temp_romfs, ignore_errors=True)
+                  if not packages:
+                      raise SystemExit(f"No NSP/XCI found inside the {label} archive.")
+                  for p in packages:
+                      add(p, label)
+              elif sig[:4] == b"PFS0":
+                  # NSP directo
+                  nsp = source.with_name(f"{label}.nsp")
+                  source.rename(nsp)
+                  add(nsp, label)
+              elif b"HEAD" in (xci_sig, xci_sig2):
+                  # XCI directo (la firma "HEAD" esta en el offset 0x100); add() lo convierte a NSP
+                  xci = source.with_name(f"{label}.xci")
+                  source.rename(xci)
+                  add(xci, label)
+              else:
+                  raise SystemExit(
+                      f"{label}: not an archive, an NSP or an XCI. "
+                      "Check the download link (Google Drive/Dropbox may have returned an HTML page)."
+                  )
 
-          # Si no vino control.nacp, generar estructura de respaldo válida de 0x4000 bytes
-          nacp_file = out_dir / "control.nacp"
-          if not nacp_file.exists():
-              print("Creando control.nacp de respaldo...")
-              buf = bytearray(0x4000)
-              title = b"Tomodachi Life: Living the Dream\x00"
-              pub = b"Nintendo\x00"
-              for i in range(16):
-                  off = i * 0x300
-                  buf[off:off+len(title)] = title
-                  buf[off+0x200:off+0x200+len(pub)] = pub
-              with open(nacp_file, "wb") as f:
-                  f.write(buf)
+          process("game")
+          process("update")
+          process("dlc")
 
-          # Asegurar copia de icono estándar
-          for icon in out_dir.glob("icon_*.dat"):
-              import shutil
-              shutil.copy2(icon, out_dir / "icon.jpg")
-              shutil.copy2(icon, out_dir / "icon.png")
-              break
+          packages = sorted(
+              p for p in game_dir.iterdir()
+              if p.is_file() and p.suffix.lower() in package_extensions
+          )
+          if not packages:
+              raise SystemExit("No game packages were prepared.")
+
+          print("\n=== Prepared game packages ===")
+          for p in packages:
+              print(f"{p.name}: {p.stat().st_size:,} bytes")
           PY
 
-          # 3. Preparar la estructura en el directorio de trabajo ~/TITLEID-work/data/v0
-          TARGET_WORK_V0="${HOME}/${PROFILE_ID}-work/data/v0"
-          mkdir -p "${HOME}/${PROFILE_ID}-work/data"
-          rm -rf "$TARGET_WORK_V0"
-          mkdir -p "$TARGET_WORK_V0"
+          test -s "$WORK/prod.keys"
 
-          ln -sfn "$EXTRACTED_GAME/exefs" "$TARGET_WORK_V0/exefs"
-          ln -sfn "$EXTRACTED_GAME/romfs" "$TARGET_WORK_V0/romfs"
-          cp "$EXTRACTED_GAME"/control.nacp "$TARGET_WORK_V0/"
-          cp "$EXTRACTED_GAME"/icon* "$TARGET_WORK_V0/" 2>/dev/null || true
-
-          echo "DM_DISPLAY_NAME=Tomodachi Life: Living the Dream" >> "$GITHUB_ENV"
-
-          if [[ ! -f "$EXTRACTED_GAME/exefs/main" ]]; then
-            echo "::error::Failed to extract exefs/main."
-            exit 1
-          fi
-
-          echo "Extraction and workspace configuration complete:"
-          ls -la "$TARGET_WORK_V0"
-
-      - name: Set Shader Profile and Update Toolchain Header
+      - name: Set shader profile and update toolchain header
         env:
           PROFILE_OVERRIDE: ${{ inputs.profile_id }}
         shell: bash
@@ -328,47 +315,41 @@ jobs:
           PROFILE_ID="${PROFILE_OVERRIDE:-010051F0207B2000}"
           PROFILE_ID="$(echo "$PROFILE_ID" | tr '[:lower:]' '[:upper:]')"
 
-          export DM_GAME="$PROFILE_ID"
-          export GAME="$PROFILE_ID"
+          if [[ ! "$PROFILE_ID" =~ ^[0-9A-F]{16}$ ]]; then
+            echo "::error::Profile ID must be exactly 16 hexadecimal characters."
+            exit 1
+          fi
+
           echo "DM_GAME=$PROFILE_ID" >> "$GITHUB_ENV"
           echo "GAME=$PROFILE_ID" >> "$GITHUB_ENV"
+          export DM_GAME="$PROFILE_ID"
 
           python dm/gfx/tools/dmsh_chain.py --update-lock
           python dm/gfx/tools/dmsh_chain.py --header
 
-      - name: Build Unsigned IPA
+      # Este script hace TODO: extraer, reescribir modulos (patch_nso.py),
+      # separar shaders, compilar librerias iOS y llamar a build_ipa.sh.
+      - name: Build unsigned IPA
         shell: bash
         run: |
           set -euo pipefail
-          EXTRACTED_GAME="$RUNNER_TEMP/ExtractedGame"
-          OUTPUT_IPA="$RUNNER_TEMP/Tomodachi-Native.ipa"
+          WORK="$RUNNER_TEMP/nxnative"
+          GAME_DIR="$RUNNER_TEMP/GameFiles"
+          OUTPUT="$RUNNER_TEMP/Tomodachi-Native.ipa"
 
-          PROFILE_ID="${GAME:-010051F0207B2000}"
-          export GAME="$PROFILE_ID"
-          export DM_GAME="$PROFILE_ID"
-          export DM_DISPLAY_NAME="Tomodachi Life: Living the Dream"
-          export WORK_DIR="${HOME}/${PROFILE_ID}-work"
-          export GAME_DIR="$EXTRACTED_GAME"
-          export ROMFS_DIR="$EXTRACTED_GAME/romfs"
-          export EXEFS_DIR="$EXTRACTED_GAME/exefs"
-          export CODE_SIGNING_ALLOWED=NO
-          export CODE_SIGN_IDENTITY=""
-          export CODE_SIGNING_REQUIRED=NO
+          python scripts/build_ipa_from_nsp.py \
+            "$GAME_DIR" \
+            -k "$WORK/prod.keys" \
+            -o "$OUTPUT" \
+            --app-name "Tomodachi Life"
 
-          chmod +x dm/ios/tools/*.sh || true
-
-          GAME="$PROFILE_ID" DM_DISPLAY_NAME="$DM_DISPLAY_NAME" bash dm/ios/tools/build_ipa.sh "$EXTRACTED_GAME"
-
-          BUILT_IPA="$(find . "$RUNNER_TEMP" "$HOME" -name "*.ipa" -type f -not -path "*/ExtractedGame/*" -not -path "$OUTPUT_IPA" -print -quit)"
-
-          if [[ -z "$BUILT_IPA" || ! -s "$BUILT_IPA" ]]; then
+          if [[ ! -s "$OUTPUT" ]]; then
             echo "::error::IPA build did not produce an output file."
             exit 1
           fi
 
-          cp "$BUILT_IPA" "$OUTPUT_IPA"
-          echo "IPA successfully created at: $OUTPUT_IPA"
-          ls -lh "$OUTPUT_IPA"
+          echo "IPA successfully created: $OUTPUT"
+          ls -lh "$OUTPUT"
 
       - name: Upload IPA
         if: success()
@@ -379,12 +360,21 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Upload build logs if available
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tomodachi-Build-Logs
+          path: |
+            ${{ runner.temp }}/GameFiles/*_build/logs/
+            ${{ runner.temp }}/GameFiles/*_survey/
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Clean up downloaded files and keys
         if: always()
         shell: bash
         run: |
           rm -rf \
             "$RUNNER_TEMP/nxnative" \
-            "$RUNNER_TEMP/Packages" \
-            "$RUNNER_TEMP/ExtractedGame" \
-            "${HOME}/${GAME:-010051F0207B2000}-work"
+            "$RUNNER_TEMP/GameFiles"
