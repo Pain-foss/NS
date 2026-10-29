@@ -24,7 +24,7 @@ jobs:
           repository: kuosuko/tomodachi-native
           ref: 5587d1bd8e311b5508ed4e8d5310796523d06ed6
 
-            - name: Patch DuoTypeCard compilation error
+      - name: Patch DuoTypeCard compilation error
         shell: bash
         run: |
           python3 - <<'PY'
@@ -63,6 +63,7 @@ jobs:
               target.write_text("\n".join(patched), encoding="utf-8")
               print("El bloque sintáctico de DuoTypeCard.m se ha reparado de forma segura.")
           PY
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -130,7 +131,7 @@ jobs:
 
           print(file_id)
           PY
-          )"
+              )"
               echo "Downloading $(basename "$output") via gdown..."
               gdown "$file_id" -O "$output"
             else
