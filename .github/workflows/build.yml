@@ -24,29 +24,45 @@ jobs:
           repository: kuosuko/tomodachi-native
           ref: 5587d1bd8e311b5508ed4e8d5310796523d06ed6
 
-      - name: Patch DuoTypeCard compilation error
+            - name: Patch DuoTypeCard compilation error
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
+
           target = Path("dm/ios/Sources/DuoTypeCard.m")
           if target.exists():
               lines = target.read_text(encoding="utf-8").splitlines()
               patched = []
-              skip_next = False
-              for line in lines:
+              skip_block = False
+              brace_depth = 0
+              
+              for idx, line in enumerate(lines):
+                  # Buscar la línea que contiene UIViewReservedRegion, o la instrucción if/llamada sin cerrar justo encima
                   if "UIViewReservedRegion" in line:
+                      # Comprobar si la línea anterior es la cabecera de un if asociado
+                      if patched and patched[-1].strip().startswith("if") and "{" in patched[-1]:
+                          patched[-1] = "// " + patched[-1]
+                      
                       patched.append("// " + line)
-                      skip_next = True
-                  elif skip_next and "r" in line:
+                      # Contar el nivel de llaves introducido por esta línea
+                      brace_depth += line.count("{") - line.count("}")
+                      # Si la instrucción no termina en punto y coma o las llaves no están equilibradas, marcar para seguir comentando
+                      if brace_depth > 0 or not line.strip().endswith(";"):
+                          skip_block = True
+                  elif skip_block:
                       patched.append("// " + line)
-                      skip_next = False
+                      brace_depth += line.count("{") - line.count("}")
+                      # Cuando las llaves vuelven a cero y se encuentra un punto y coma o un bloque cerrado, dejar de comentar
+                      if brace_depth <= 0 and (line.strip().endswith(";") or line.strip().endswith("}")):
+                          skip_block = False
+                          brace_depth = 0
                   else:
                       patched.append(line)
-              target.write_text("\n".join(patched), encoding="utf-8")
-              print("DuoTypeCard.m parcheado correctamente.")
-          PY
 
+              target.write_text("\n".join(patched), encoding="utf-8")
+              print("El bloque sintáctico de DuoTypeCard.m se ha reparado de forma segura.")
+          PY
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
