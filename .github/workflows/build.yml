@@ -233,7 +233,9 @@ jobs:
           PROFILE_ID="$(echo "$PROFILE_ID" | tr '[:lower:]' '[:upper:]')"
 
           export DM_GAME="$PROFILE_ID"
+          export GAME="$PROFILE_ID"
           echo "DM_GAME=$PROFILE_ID" >> "$GITHUB_ENV"
+          echo "GAME=$PROFILE_ID" >> "$GITHUB_ENV"
 
           python dm/gfx/tools/dmsh_chain.py --update-lock
           python dm/gfx/tools/dmsh_chain.py --header
@@ -245,7 +247,9 @@ jobs:
           EXTRACTED_GAME="$RUNNER_TEMP/ExtractedGame"
           OUTPUT_IPA="$RUNNER_TEMP/Tomodachi-Native.ipa"
 
-          export DM_GAME="${DM_GAME:-010051F0207B2000}"
+          PROFILE_ID="${GAME:-010051F0207B2000}"
+          export GAME="$PROFILE_ID"
+          export DM_GAME="$PROFILE_ID"
           export GAME_DIR="$EXTRACTED_GAME"
           export ROMFS_DIR="$EXTRACTED_GAME/romfs"
           export EXEFS_DIR="$EXTRACTED_GAME/exefs"
@@ -255,9 +259,8 @@ jobs:
 
           chmod +x dm/ios/tools/*.sh || true
 
-          bash dm/ios/tools/build_ipa.sh "$EXTRACTED_GAME"
+          GAME="$PROFILE_ID" bash dm/ios/tools/build_ipa.sh "$EXTRACTED_GAME"
 
-          # Buscar el archivo .ipa generado en el workspace o en RUNNER_TEMP
           BUILT_IPA="$(find . "$RUNNER_TEMP" -name "*.ipa" -type f -not -path "*/ExtractedGame/*" -not -path "$OUTPUT_IPA" -print -quit)"
 
           if [[ -z "$BUILT_IPA" || ! -s "$BUILT_IPA" ]]; then
