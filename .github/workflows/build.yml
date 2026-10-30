@@ -24,6 +24,18 @@ jobs:
           repository: kuosuko/tomodachi-native
           ref: 5587d1bd8e311b5508ed4e8d5310796523d06ed6
 
+      # Diagnostico: muestra el codigo REAL antes de parchear
+      - name: Show DuoTypeCard.m context (before patch)
+        shell: bash
+        run: |
+          echo "=== Lineas 70-110 ==="
+          nl -ba dm/ios/Sources/DuoTypeCard.m | sed -n '70,110p'
+          echo "=== Apariciones de UIViewReservedRegion ==="
+          grep -n "UIViewReservedRegion" dm/ios/Sources/DuoTypeCard.m || true
+
+      # Parche con balance de llaves: comenta las lineas con UIViewReservedRegion,
+      # la cabecera "if/else {" inmediata si existe, y las "}" que cierran
+      # cualquier "{" comentado. Si al final las llaves no cuadran, falla en segundos.
       - name: Patch DuoTypeCard compilation error
         shell: bash
         run: |
@@ -31,38 +43,79 @@ jobs:
           from pathlib import Path
 
           target = Path("dm/ios/Sources/DuoTypeCard.m")
-          if target.exists():
-              lines = target.read_text(encoding="utf-8").splitlines()
-              patched = []
-              skip_block = False
-              brace_depth = 0
-              
-              for idx, line in enumerate(lines):
-                  # Buscar la línea que contiene UIViewReservedRegion, o la instrucción if/llamada sin cerrar justo encima
-                  if "UIViewReservedRegion" in line:
-                      # Comprobar si la línea anterior es la cabecera de un if asociado
-                      if patched and patched[-1].strip().startswith("if") and "{" in patched[-1]:
-                          patched[-1] = "// " + patched[-1]
-                      
-                      patched.append("// " + line)
-                      # Contar el nivel de llaves introducido por esta línea
-                      brace_depth += line.count("{") - line.count("}")
-                      # Si la instrucción no termina en punto y coma o las llaves no están equilibradas, marcar para seguir comentando
-                      if brace_depth > 0 or not line.strip().endswith(";"):
-                          skip_block = True
-                  elif skip_block:
-                      patched.append("// " + line)
-                      brace_depth += line.count("{") - line.count("}")
-                      # Cuando las llaves vuelven a cero y se encuentra un punto y coma o un bloque cerrado, dejar de comentar
-                      if brace_depth <= 0 and (line.strip().endswith(";") or line.strip().endswith("}")):
-                          skip_block = False
-                          brace_depth = 0
-                  else:
-                      patched.append(line)
+          if not target.exists():
+              raise SystemExit("DuoTypeCard.m no encontrado")
 
-              target.write_text("\n".join(patched), encoding="utf-8")
-              print("El bloque sintáctico de DuoTypeCard.m se ha reparado de forma segura.")
+          lines = target.read_text(encoding="utf-8").splitlines()
+
+          def delta(ls):
+              return sum(l.count("{") - l.count("}") for l in ls)
+
+          def active_balance(ls, commented):
+              return delta([l for i, l in enumerate(ls) if i not in commented])
+
+          orig_balance = delta(lines)
+          hits = [i for i, l in enumerate(lines) if "UIViewReservedRegion" in l]
+          if not hits:
+              print("No hay lineas con UIViewReservedRegion; nada que parchear.")
+              raise SystemExit(0)
+
+          commented = set()
+          for i in hits:
+              # cabecera previa tipo "if (...) {" / "else {"
+              k = i - 1
+              while k >= 0 and not lines[k].strip():
+                  k -= 1
+              if k >= 0:
+                  prev = lines[k].strip()
+                  if prev.endswith("{") and (prev.startswith("if") or prev.startswith("else") or prev.startswith("@available")):
+                      commented.add(k)
+              # la sentencia puede ocupar varias lineas
+              j = i
+              commented.add(j)
+              while j + 1 < len(lines) and not lines[j].rstrip().endswith((";", "{", "}")):
+                  j += 1
+                  commented.add(j)
+
+          # Cerrar los bloques que hemos abierto al comentar
+          pending = delta([lines[i] for i in commented])
+          if pending > 0:
+              j = max(commented) + 1
+              while pending > 0 and j < len(lines):
+                  if lines[j].strip() in ("}", "};"):
+                      commented.add(j)
+                      pending -= 1
+                  elif lines[j].strip() == "" or j in commented:
+                      pass
+                  else:
+                      # codigo dentro del bloque: tambien se comenta
+                      commented.add(j)
+                      pending += lines[j].count("{") - lines[j].count("}")
+                  j += 1
+          elif pending < 0:
+              print("AVISO: se comentaron mas '}' que '{'; revisa el contexto.")
+
+          patched = [("// " + l) if i in commented else l for i, l in enumerate(lines)]
+
+          new_balance = active_balance(lines, commented)
+          if new_balance != orig_balance:
+              print("=== Contexto original 80-100 ===")
+              for n, l in enumerate(lines[79:100], start=80):
+                  print(f"{n}: {l}")
+              raise SystemExit(
+                  f"Parche desbalancea llaves (original={orig_balance}, parcheado={new_balance}). Abortando."
+              )
+
+          target.write_text("\n".join(patched) + "\n", encoding="utf-8")
+          print(f"DuoTypeCard.m parcheado: {len(commented)} lineas comentadas, llaves balanceadas.")
           PY
+
+      - name: Show DuoTypeCard.m diff (after patch)
+        shell: bash
+        run: |
+          git --no-pager diff -- dm/ios/Sources/DuoTypeCard.m || true
+          echo "=== Lineas 70-110 tras el parche ==="
+          nl -ba dm/ios/Sources/DuoTypeCard.m | sed -n '70,110p'
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -406,6 +459,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # Ahora tambien sube el log completo de xcodebuild (build.log)
       - name: Upload build logs if available
         if: always()
         uses: actions/upload-artifact@v4
@@ -413,6 +467,7 @@ jobs:
           name: Tomodachi-Build-Logs
           path: |
             ${{ runner.temp }}/GameFiles/*_build/logs/
+            ${{ runner.temp }}/GameFiles/*_build/ipa/build/ios/pkg/build.log
             ${{ runner.temp }}/GameFiles/*_survey/
           if-no-files-found: ignore
           retention-days: 7
