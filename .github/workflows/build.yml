@@ -69,9 +69,25 @@ jobs:
         shell: bash
         run: |
           python3 - <<'PY'
+          import re
           from pathlib import Path
 
           TOKENS = ("UIViewReservedRegion", "UIHinge", "reservedRegion", "hingeChanged")
+          KEYWORDS = {"if", "for", "while", "switch", "return", "else", "do", "sizeof"}
+          DECL = [
+              re.compile(r"\(\^\s*(\w+)\s*\)"),
+              re.compile(r"\b(\w+)\s*=\s*\^"),
+              re.compile(r"^\s*(?:static\s+|inline\s+)*[A-Za-z_][\w \*<>]*?[ \*](\w+)\s*\([^;]*\)\s*\{?\s*$"),
+          ]
+
+          def declared_names(ls):
+              names = set()
+              for l in ls:
+                  for pat in DECL:
+                      for n in pat.findall(l):
+                          if n not in KEYWORDS:
+                              names.add(n)
+              return names
 
           def delta(ls):
               return sum(l.count("{") - l.count("}") for l in ls)
@@ -115,6 +131,22 @@ jobs:
                       print("...")
                   raise SystemExit(f"{path}: llaves desbalanceadas tras el parche ({orig} -> {new}). Abortando.")
               out = [("// " + l) if i in commented else l for i, l in enumerate(lines)]
+
+              # Si se comento la definicion de un helper/bloque (p.ej. "hit") que el
+              # codigo restante sigue llamando, se define como macro que devuelve 0.
+              active = [l for i, l in enumerate(lines) if i not in commented]
+              active_text = "\n".join(active)
+              gone = declared_names([lines[i] for i in commented]) - declared_names(active)
+              stubs = [n for n in sorted(gone) if re.search(r"\b" + re.escape(n) + r"\s*\(", active_text)]
+              if stubs:
+                  at = 0
+                  for i, l in enumerate(out):
+                      if re.match(r"\s*#\s*(import|include)\b", l):
+                          at = i + 1
+                  macros = ["/* dm fallback: helper desactivado */"] + [f"#define {n}(...) 0" for n in stubs]
+                  out[at:at] = macros
+                  print(f"{path}: macros de respaldo para {stubs}")
+
               path.write_text("\n".join(out) + "\n", encoding="utf-8")
               print(f"{path}: {len(commented)} lineas comentadas")
               return len(commented)
@@ -125,6 +157,8 @@ jobs:
           print(f"Total: {total} lineas desactivadas")
           PY
           git --no-pager diff --stat || true
+          echo "=== Diff completo del parche ==="
+          git --no-pager diff -U2 -- dm/ios/Sources || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
